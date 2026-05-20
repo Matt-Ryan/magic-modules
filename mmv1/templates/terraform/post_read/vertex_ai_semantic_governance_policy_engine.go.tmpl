@@ -1,0 +1,7 @@
+// SemanticGovernancePolicyEngine post-Read state dispatch.
+// All logic lives in sgpePostReadDispatch (declared in
+// mmv1/templates/terraform/constants/sgpe_post_read.go.tmpl) so it can be
+// unit-tested in isolation. See ADR-0002 §Decision 5 Implementation Notes.
+if err := sgpePostReadDispatch(d, res); err != nil {
+	return err
+}

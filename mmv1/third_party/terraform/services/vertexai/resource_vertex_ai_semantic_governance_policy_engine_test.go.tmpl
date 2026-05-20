@@ -1,0 +1,227 @@
+package vertexai_test
+{{- if ne $.TargetVersionName "ga" }}
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+
+	"github.com/hashicorp/terraform-provider-google/google/acctest"
+	"github.com/hashicorp/terraform-provider-google/google/envvar"
+	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
+	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
+)
+
+// TestAccVertexAISemanticGovernancePolicyEngine_lifecycle exercises the
+// full SGPE lifecycle in one Create/Destroy envelope:
+//
+//	Step 1: Apply basic fixture        (Create LRO ~20 min)
+//	Step 2: ImportStateVerify          (no LRO, just round-trip)
+//	Step 3: Apply updated fixture      (Update LRO ~20 min, target_project change)
+//	Step 4: ImportStateVerify          (no LRO)
+//	Step 5: Apply addGateway fixture   (Update LRO ~20 min, gateway_config block added)
+//	Step 6: ImportStateVerify          (no LRO)
+//	CheckDestroy: invokes custom_delete (Deprovision LRO ~20 min)
+//
+// Pattern source: TestAccVertexAIFeatureGroup_updated in
+// resource_vertex_ai_feature_group_test.go.
+//
+// **This test is gated on a TRUSTED_TESTER+ allowlisted SGPE backend
+// being available to HashiCorp CI.** Until that gate clears, the
+// example fixtures are marked exclude_test: true in the YAML; this
+// test file is still emitted (it's a handwritten file, not generated
+// from an example) but the test will fail on PreCheck against a
+// non-allowlisted project. To enable in CI, remove exclude_test from
+// the example entries in SemanticGovernancePolicyEngine.yaml.
+func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
+	t.Parallel()
+
+	context := map[string]interface{}{
+		"project":         envvar.GetTestProjectFromEnv(),
+		"target_project":  envvar.GetTestProjectFromEnv(),
+	}
+
+	acctest.VcrTest(t, resource.TestCase{
+		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
+		CheckDestroy:             testAccCheckVertexAISemanticGovernancePolicyEngineDestroyProducer(t),
+		Steps: []resource.TestStep{
+			// Step 1: Create with the basic fixture (no target_project).
+			{
+				Config: testAccVertexAISemanticGovernancePolicyEngine_basic(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"state", "ACTIVE"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"name"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"create_time"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"psc_service_attachment"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"ip_address"),
+				),
+			},
+			// Step 2: ImportStateVerify after Create. Confirms the
+			// importer round-trips state cleanly.
+			{
+				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			// Step 3: Update — set target_project. This exercises the
+			// PATCH+update_mask path; the request URL should contain
+			// ?updateMask=targetProject (verifiable via TF_LOG=DEBUG
+			// capture, not asserted programmatically here).
+			{
+				Config: testAccVertexAISemanticGovernancePolicyEngine_updated(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"target_project", context["target_project"].(string)),
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"state", "ACTIVE"),
+				),
+			},
+			// Step 4: ImportStateVerify after Update.
+			{
+				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			// Step 5: addGateway — add one gateway_config block. This
+			// exercises the native Map declaration's expand path: the
+			// HCL TypeSet element should round-trip into the proto
+			// gatewayConfigs map keyed by `name`.
+			{
+				Config: testAccVertexAISemanticGovernancePolicyEngine_addGateway(context),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"gateway_config.#", "1"),
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"gateway_config.0.name", "primary"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"gateway_config.0.psc_endpoint"),
+					resource.TestCheckResourceAttrSet(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"gateway_config.0.ip_address"),
+				),
+			},
+			// Step 6: ImportStateVerify after addGateway. The presence of
+			// this step is the critical SGPE-specific assertion: it
+			// confirms the native Map declaration's flatten path produces
+			// a stable round-trip through Import (no drift in the proto
+			// map → TypeSet conversion).
+			{
+				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+func testAccVertexAISemanticGovernancePolicyEngine_basic(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
+  region   = "us-central1"
+  provider = google-beta
+}
+`, context)
+}
+
+func testAccVertexAISemanticGovernancePolicyEngine_updated(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
+  region          = "us-central1"
+  target_project  = "%{target_project}"
+  provider        = google-beta
+}
+`, context)
+}
+
+func testAccVertexAISemanticGovernancePolicyEngine_addGateway(context map[string]interface{}) string {
+	return acctest.Nprintf(`
+data "google_project" "project" {
+  provider = google-beta
+}
+
+resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
+  region          = "us-central1"
+  target_project  = "%{target_project}"
+  provider        = google-beta
+
+  gateway_config {
+    name       = "primary"
+    network    = "projects/${data.google_project.project.project_id}/global/networks/default"
+    subnetwork = "projects/${data.google_project.project.project_id}/regions/us-central1/subnetworks/default"
+  }
+}
+`, context)
+}
+
+// testAccCheckVertexAISemanticGovernancePolicyEngineDestroyProducer
+// asserts the engine has been deprovisioned. SGPE is a singleton per
+// AIP-156: a Get against a deprovisioned engine returns HTTP 200 with
+// state INACTIVE, NOT a 404. This destroy check therefore asserts
+// state == "INACTIVE", not "GET returns error".
+func testAccCheckVertexAISemanticGovernancePolicyEngineDestroyProducer(t *testing.T) func(s *terraform.State) error {
+	return func(s *terraform.State) error {
+		for name, rs := range s.RootModule().Resources {
+			if rs.Type != "google_vertex_ai_semantic_governance_policy_engine" {
+				continue
+			}
+			if strings.HasPrefix(name, "data.") {
+				continue
+			}
+
+			config := acctest.GoogleProviderConfig(t)
+
+			url, err := tpgresource.ReplaceVarsForTest(config, rs, "{{"{{"}}VertexAIBasePath{{"}}"}}projects/{{"{{"}}project{{"}}"}}/locations/{{"{{"}}region{{"}}"}}/semanticGovernancePolicyEngine")
+			if err != nil {
+				return err
+			}
+
+			billingProject := ""
+			if config.BillingProject != "" {
+				billingProject = config.BillingProject
+			}
+
+			res, err := transport_tpg.SendRequest(transport_tpg.SendRequestOptions{
+				Config:    config,
+				Method:    "GET",
+				Project:   billingProject,
+				RawURL:    url,
+				UserAgent: config.UserAgent,
+			})
+			if err != nil {
+				// Unexpected error (not the "200 with INACTIVE" we expect).
+				// Surface it loudly per the loud-failure stance.
+				return fmt.Errorf("unexpected error checking SemanticGovernancePolicyEngine deprovision state at %s: %s", url, err)
+			}
+
+			state, ok := res["state"].(string)
+			if !ok {
+				return fmt.Errorf("SemanticGovernancePolicyEngine GET at %s returned no state field; backend regression", url)
+			}
+			if state != "INACTIVE" {
+				return fmt.Errorf("SemanticGovernancePolicyEngine at %s was not deprovisioned: state is %q (expected INACTIVE)", url, state)
+			}
+		}
+		return nil
+	}
+}
+
+{{ end }}

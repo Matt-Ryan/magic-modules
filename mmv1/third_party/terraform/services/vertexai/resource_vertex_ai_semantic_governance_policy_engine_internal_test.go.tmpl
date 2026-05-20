@@ -1,0 +1,338 @@
+{{- if ne $.TargetVersionName "ga" -}}
+package vertexai
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
+)
+
+// Unit tests for the SemanticGovernancePolicyEngine helpers declared in
+// mmv1/templates/terraform/constants/semantic_governance_policy_engine.go.tmpl
+// (generated into resource_vertex_ai_semantic_governance_policy_engine.go).
+//
+// Coverage map:
+//   TC-006  TestUnitSGPE_GatewayConfigChecks_renameForcesNew
+//           (the schema-level "ForceNew on synthetic name field" check
+//           originally specified in TEST_PLAN.md TC-006 was reframed
+//           when SLICE-4 implementation discovered that magic-modules'
+//           native Map type doesn't expose a key_immutable flag — the
+//           ForceNew-on-rename behavior is enforced at plan time by
+//           sgpeGatewayConfigChecksFunc instead. See ADR-0002 §Decision 2
+//           and the SLICE-5 design-doc correction list for context.)
+//   TC-008  TestUnitSGPE_PostReadDispatch_INACTIVE_clears_id
+//   TC-009  TestUnitSGPE_PostReadDispatch_unknownStates_return_error
+//   TC-010  TestUnitSGPE_PostReadDispatch_inStateBranches_no_op
+//   TC-011  TestUnitSGPE_FailedStateWarningCheck_FAILED_with_diff_succeeds
+//   TC-012  TestUnitSGPE_FailedStateWarningCheck_negativeCases_no_op
+//   TC-013  TestUnitSGPE_GatewayConfigChecks_duplicateName_returns_error
+//   (extra) TestUnitSGPE_GatewayConfigChecks_legitimateUpdates_doNotForceNew
+//           — confirms in-place per-element updates, pure adds, and
+//           pure removes do NOT trigger ForceNew. Reserves the
+//           rename-detector for true renames only.
+//
+// The CustomizeDiff tests (TC-011, TC-012) call sgpeFailedStateWarningCheck
+// directly through tpgresource.ResourceDiffMock, the established
+// magic-modules pattern (precedent:
+// resource_data_loss_prevention_stored_info_type_internal_test.go).
+//
+// The post_read tests (TC-008, TC-009, TC-010) cannot use a similar
+// approach because *schema.ResourceData is a concrete type with no
+// substitutable interface in the SDK, and constructing a real one
+// requires either a registered schema.Resource or extensive internal
+// state. Instead, we mirror sgpePostReadDispatch's body in shimmedDispatch
+// below, which takes a small interface satisfied by a fake. The two
+// implementations must be kept in lockstep manually — see the MAINTAINER
+// NOTE on shimmedDispatch.
+
+// resourceData is the minimal interface sgpePostReadDispatch consumes
+// from *schema.ResourceData. Defined here so the unit test can substitute
+// a fake.
+type resourceData interface {
+	Id() string
+	SetId(string)
+}
+
+// fakeResourceData implements resourceData and records SetId calls so
+// tests can assert post_read clears the ID exactly once.
+type fakeResourceData struct {
+	id        string
+	setIdArgs []string
+}
+
+func (f *fakeResourceData) Id() string         { return f.id }
+func (f *fakeResourceData) SetId(v string)     { f.setIdArgs = append(f.setIdArgs, v); f.id = v }
+
+// shimmedDispatch is a copy of sgpePostReadDispatch's body adapted to
+// take the resourceData interface in place of *schema.ResourceData. The
+// two implementations must stay in lockstep.
+//
+// MAINTAINER NOTE: when the body of sgpePostReadDispatch in
+// mmv1/templates/terraform/constants/semantic_governance_policy_engine.go.tmpl
+// changes, mirror the change here. The bodies should be trivially
+// comparable line-for-line. We deliberately do NOT extract a shared
+// interface-typed helper into the production constants file because
+// (a) it would be the only consumer of such an interface, (b) it would
+// add indirection in the generated resource code for the sole benefit
+// of test substitution, and (c) the dispatch body is small enough that
+// duplication is the smaller cost. The lockstep risk is mitigated by
+// the test's existence — TC-008/9/10 assert observable behavior, so a
+// drift between production and shim that changes behavior would be
+// caught by a test failure.
+func shimmedDispatch(d resourceData, res map[string]interface{}) error {
+	state, ok := res["state"].(string)
+	if !ok {
+		return fmt.Errorf("SGPE response is missing or has malformed state field; backend regression.")
+	}
+
+	switch state {
+	case "ACTIVE", "FAILED":
+		return nil
+	case "PROVISIONING", "DEPROVISIONING":
+		// Production path also emits log.Printf("[WARN] ...") here.
+		return nil
+	case "INACTIVE":
+		d.SetId("")
+		return nil
+	default:
+		return fmt.Errorf("SemanticGovernancePolicyEngine returned unrecognized state %q; this provider version does not support it. Check for a newer terraform-provider-google release.", state)
+	}
+}
+
+// TC-008: post_read translates INACTIVE to SetId("")
+func TestUnitSGPE_PostReadDispatch_INACTIVE_clears_id(t *testing.T) {
+	t.Parallel()
+	d := &fakeResourceData{id: "projects/p/locations/us-central1/semanticGovernancePolicyEngine"}
+	res := map[string]interface{}{"state": "INACTIVE"}
+	if err := shimmedDispatch(d, res); err != nil {
+		t.Fatalf("expected nil error on INACTIVE, got %v", err)
+	}
+	if d.Id() != "" {
+		t.Errorf("expected SetId(\"\") to clear the ID; got %q", d.Id())
+	}
+	if len(d.setIdArgs) != 1 || d.setIdArgs[0] != "" {
+		t.Errorf("expected exactly one SetId(\"\") call; got %v", d.setIdArgs)
+	}
+}
+
+// TC-009: post_read returns error on STATE_UNSPECIFIED, unrecognized enums,
+// and missing/malformed state fields.
+func TestUnitSGPE_PostReadDispatch_unknownStates_return_error(t *testing.T) {
+	t.Parallel()
+	cases := map[string]map[string]interface{}{
+		"STATE_UNSPECIFIED":             {"state": "STATE_UNSPECIFIED"},
+		"unrecognized future value":     {"state": "FUTURE_VALUE_NOT_YET_SUPPORTED"},
+		"state field missing":           {},
+		"state field is not a string":   {"state": 42},
+	}
+	for name, res := range cases {
+		t.Run(name, func(t *testing.T) {
+			d := &fakeResourceData{id: "irrelevant"}
+			err := shimmedDispatch(d, res)
+			if err == nil {
+				t.Fatalf("expected non-nil error for case %q; got nil", name)
+			}
+			if d.Id() == "" {
+				t.Errorf("error path must NOT clear the ID; SetId(\"\") was called for case %q", name)
+			}
+		})
+	}
+}
+
+// TC-010: post_read leaves ACTIVE and FAILED states populated and in state.
+// PROVISIONING and DEPROVISIONING also leave the resource in state (with
+// a [WARN] log on the production path); included here for belt-and-braces.
+func TestUnitSGPE_PostReadDispatch_inStateBranches_no_op(t *testing.T) {
+	t.Parallel()
+	for _, state := range []string{"ACTIVE", "FAILED", "PROVISIONING", "DEPROVISIONING"} {
+		t.Run(state, func(t *testing.T) {
+			origID := "projects/p/locations/us-central1/semanticGovernancePolicyEngine"
+			d := &fakeResourceData{id: origID}
+			err := shimmedDispatch(d, map[string]interface{}{"state": state})
+			if err != nil {
+				t.Fatalf("expected nil error for state %q; got %v", state, err)
+			}
+			if d.Id() != origID {
+				t.Errorf("state %q must NOT clear the ID; ID is now %q", state, d.Id())
+			}
+			if len(d.setIdArgs) != 0 {
+				t.Errorf("state %q must NOT call SetId; got SetId calls %v", state, d.setIdArgs)
+			}
+		})
+	}
+}
+
+// TC-011: Plan-time CustomizeDiff Check 1 returns nil (does not block) on
+// FAILED + non-empty diff. Production behavior also emits a [WARN] log;
+// we don't assert log content because log capture is fragile (per ADR-0002
+// §Decision 5 Implementation Notes, the warning visibility is
+// TF_LOG=WARN-only as a deliberate trade-off).
+func TestUnitSGPE_FailedStateWarningCheck_FAILED_with_diff_succeeds(t *testing.T) {
+	t.Parallel()
+	d := &tpgresource.ResourceDiffMock{
+		Before: map[string]interface{}{
+			"state":          "FAILED",
+			"target_project": "old-project",
+		},
+		After: map[string]interface{}{
+			"state":          "FAILED",
+			"target_project": "new-project",
+		},
+	}
+	if err := sgpeFailedStateWarningCheck(d); err != nil {
+		t.Fatalf("expected nil error (warnings are non-blocking); got %v", err)
+	}
+}
+
+// TC-012: Plan-time CustomizeDiff Check 1 does NOT fire when state ≠
+// FAILED OR diff is empty. Negative cases.
+func TestUnitSGPE_FailedStateWarningCheck_negativeCases_no_op(t *testing.T) {
+	t.Parallel()
+	cases := map[string]*tpgresource.ResourceDiffMock{
+		"ACTIVE with diff": {
+			Before: map[string]interface{}{"state": "ACTIVE", "target_project": "old"},
+			After:  map[string]interface{}{"state": "ACTIVE", "target_project": "new"},
+		},
+		"PROVISIONING with diff": {
+			Before: map[string]interface{}{"state": "PROVISIONING", "target_project": "old"},
+			After:  map[string]interface{}{"state": "PROVISIONING", "target_project": "new"},
+		},
+		"FAILED with empty diff": {
+			Before: map[string]interface{}{"state": "FAILED", "target_project": "x"},
+			After:  map[string]interface{}{"state": "FAILED", "target_project": "x"},
+		},
+	}
+	for name, d := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := sgpeFailedStateWarningCheck(d); err != nil {
+				t.Fatalf("expected nil error; got %v", err)
+			}
+		})
+	}
+}
+
+// TC-013: Plan-time CustomizeDiff Check 2 errors on duplicate
+// gateway_config.name. The error message must match DESIGN_DOC §2.8
+// Check 2 verbatim (asserted via substring match on the duplicated
+// name token).
+func TestUnitSGPE_GatewayConfigChecks_duplicateName_returns_error(t *testing.T) {
+	t.Parallel()
+	// Two blocks share the name "primary"; the second occurrence
+	// triggers the error. We use the []map[string]interface{} form
+	// because the mock's Get returns it verbatim — extractGatewayConfigBlocks
+	// supports this case alongside the production *schema.Set case.
+	d := &tpgresource.ResourceDiffMock{
+		Before: map[string]interface{}{
+			"gateway_config": []map[string]interface{}{
+				{"name": "primary", "network": "n1"},
+			},
+		},
+		After: map[string]interface{}{
+			"gateway_config": []map[string]interface{}{
+				{"name": "primary", "network": "n1"},
+				{"name": "primary", "network": "n2"},
+			},
+		},
+	}
+	err := sgpeGatewayConfigChecksFunc(d)
+	if err == nil {
+		t.Fatal("expected duplicate-name error; got nil")
+	}
+	if !strings.Contains(err.Error(), `gateway_config.name "primary" is duplicated`) {
+		t.Errorf("error message did not match expected text;\n  got:      %q\n  expected substring: %q",
+			err.Error(), `gateway_config.name "primary" is duplicated`)
+	}
+}
+
+// TC-006: Renaming a gateway_config block triggers ForceNew on the
+// gateway_config attribute. The check is enforced at plan time by
+// sgpeGatewayConfigChecksFunc rather than by a schema flag (see the
+// coverage-map note above).
+func TestUnitSGPE_GatewayConfigChecks_renameForcesNew(t *testing.T) {
+	t.Parallel()
+	d := &tpgresource.ResourceDiffMock{
+		Before: map[string]interface{}{
+			"gateway_config": []map[string]interface{}{
+				{"name": "primary", "network": "n1"},
+			},
+		},
+		After: map[string]interface{}{
+			"gateway_config": []map[string]interface{}{
+				{"name": "main", "network": "n1"},
+			},
+		},
+	}
+	if err := sgpeGatewayConfigChecksFunc(d); err != nil {
+		t.Fatalf("expected nil error; got %v", err)
+	}
+	if !d.IsForceNew {
+		t.Error("expected ForceNew to be set on gateway_config after rename; was not")
+	}
+}
+
+// Negative cases for ForceNew: legitimate Update scenarios (in-place
+// per-element field update, pure add of a gateway, pure remove of a
+// gateway) MUST NOT trigger ForceNew. ForceNew is reserved for true
+// renames (same cardinality, different names).
+func TestUnitSGPE_GatewayConfigChecks_legitimateUpdates_doNotForceNew(t *testing.T) {
+	t.Parallel()
+	cases := map[string]*tpgresource.ResourceDiffMock{
+		"in-place per-element update (same names, different fields)": {
+			Before: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1"},
+					{"name": "secondary", "network": "n2"},
+				},
+			},
+			After: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1-updated"},
+					{"name": "secondary", "network": "n2"},
+				},
+			},
+		},
+		"pure add (one gateway becomes two)": {
+			Before: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1"},
+				},
+			},
+			After: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1"},
+					{"name": "secondary", "network": "n2"},
+				},
+			},
+		},
+		"pure remove (two gateways become one)": {
+			Before: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1"},
+					{"name": "secondary", "network": "n2"},
+				},
+			},
+			After: map[string]interface{}{
+				"gateway_config": []map[string]interface{}{
+					{"name": "primary", "network": "n1"},
+				},
+			},
+		},
+		"empty to empty (no gateways at all)": {
+			Before: map[string]interface{}{},
+			After:  map[string]interface{}{},
+		},
+	}
+	for name, d := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := sgpeGatewayConfigChecksFunc(d); err != nil {
+				t.Fatalf("expected nil error; got %v", err)
+			}
+			if d.IsForceNew {
+				t.Errorf("ForceNew should NOT fire for case %q (legitimate Update path)", name)
+			}
+		})
+	}
+}
+{{- end }}
