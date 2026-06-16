@@ -67,19 +67,26 @@ func sgpePostReadDispatch(d *schema.ResourceData, res map[string]interface{}) er
 }
 
 // ---------------------------------------------------------------------------
-// CustomizeDiff helpers (Check 1 in SLICE-2; Check 2 added in SLICE-4)
+// CustomizeDiff helpers
 // ---------------------------------------------------------------------------
 
 // sgpeMutableFieldNames lists the schema field names that, when changed,
 // constitute a "non-empty diff" for the purposes of Check 1.
 //
-// MAINTAINER NOTE: when SLICE-4 adds gateway_config or any future slice
-// adds a new mutable field to the SGPE schema, append the new field name
-// here. Output-only fields (state, name, create_time, update_time,
-// psc_service_attachment, ip_address, psc_forwarding_rule, and per-gateway
-// outputs) MUST NOT appear here — they change as the result of an apply,
-// not as the cause of one, and including them would make Check 1 fire on
-// every refresh-after-apply against a FAILED engine.
+// The list is currently empty because the initial CL exposes only the
+// immutable `region` parameter plus output-only fields — there are no
+// user-settable mutable fields for Check 1 to guard. The Check 1
+// scaffolding is retained so subsequent fast-follow CLs that introduce
+// mutable user-facing surface (e.g. `target_project`, `gateway_config`)
+// can re-enable Check 1 by appending the new field name here, without
+// having to reintroduce the surrounding helpers and CustomizeDiff
+// plumbing.
+//
+// Output-only fields (state, name, create_time, update_time,
+// psc_service_attachment, ip_address, psc_forwarding_rule) MUST NOT
+// appear here — they change as the result of an apply, not as the cause
+// of one, and including them would make Check 1 fire on every
+// refresh-after-apply against a FAILED engine.
 //
 // Why an explicit list instead of diff.GetChangedKeysPrefix(""): the
 // tpgresource.TerraformResourceDiff interface used by unit tests does NOT
@@ -87,10 +94,7 @@ func sgpePostReadDispatch(d *schema.ResourceData, res map[string]interface{}) er
 // and we want unit tests to exercise the same code path as production. An
 // explicit list keeps the two paths identical at the cost of one line of
 // maintenance per mutable schema field added.
-var sgpeMutableFieldNames = []string{
-	"target_project",
-	"gateway_config",
-}
+var sgpeMutableFieldNames = []string{}
 
 // sgpeHasNonEmptyDiff returns true if any field in sgpeMutableFieldNames
 // has changed in the planned diff. Used by Check 1 to suppress the
@@ -145,155 +149,11 @@ func sgpeFailedStateWarningCheck(diff tpgresource.TerraformResourceDiff) error {
 	return nil
 }
 
-// extractGatewayConfigBlocks pulls the planned gateway_config blocks out
-// of the diff in a form usable by both production code and unit tests.
-//
-// Production *schema.ResourceDiff.Get("gateway_config") returns a
-// *schema.Set (whose .List() yields []interface{} of map[string]interface{}).
-// The test mock tpgresource.ResourceDiffMock.Get returns whatever was
-// stuffed into After["gateway_config"] verbatim. To make Check 2 and the
-// rename-detection logic agree across both worlds, this helper accepts
-// either form via type switch and returns the canonical
-// []map[string]interface{} representation.
-//
-// Returning a slice (not a map) preserves block order, which the unit
-// tests use for stable case naming.
-func extractGatewayConfigBlocks(raw interface{}) []map[string]interface{} {
-	if raw == nil {
-		return nil
-	}
-	switch v := raw.(type) {
-	case *schema.Set:
-		out := make([]map[string]interface{}, 0, v.Len())
-		for _, item := range v.List() {
-			if m, ok := item.(map[string]interface{}); ok {
-				out = append(out, m)
-			}
-		}
-		return out
-	case []interface{}:
-		out := make([]map[string]interface{}, 0, len(v))
-		for _, item := range v {
-			if m, ok := item.(map[string]interface{}); ok {
-				out = append(out, m)
-			}
-		}
-		return out
-	case []map[string]interface{}:
-		return v
-	default:
-		return nil
-	}
-}
-
-// gatewayConfigNames returns the set of `name` values from the given
-// blocks. Used by both Check 2 (duplicate detection) and the rename
-// detector. Returns names in iteration order so duplicates are spotted
-// at first occurrence.
-func gatewayConfigNames(blocks []map[string]interface{}) []string {
-	out := make([]string, 0, len(blocks))
-	for _, block := range blocks {
-		name, _ := block["name"].(string)
-		out = append(out, name)
-	}
-	return out
-}
-
-// sgpeGatewayConfigChecksFunc implements Check 2 (duplicate gateway_config
-// name validation) and the related ForceNew-on-rename behavior. It is the
-// testable internal entry point; the public YAML-facing wrapper is
-// sgpeCustomizeDiff below.
-//
-// Check 2 (duplicate names): returns an error on the first duplicate
-// `name` value across planned gateway_config blocks. The message matches
-// DESIGN_DOC §2.8 Check 2 verbatim. Hard error — blocks the plan.
-//
-// Rename detection: when the prior set's names differ from the planned
-// set's names (i.e., the user renamed a block), call diff.ForceNew on
-// the gateway_config attribute. This realizes the
-// rename-triggers-re-create semantic that DESIGN_DOC §2.5.1 originally
-// expected to come from a declarative `immutable: true` flag on the
-// synthetic key field. The magic-modules native Map type doesn't expose
-// such a flag for the synthetic key (only `key_name` is supported), so
-// the same behavior is enforced at plan time here. Without this check,
-// a rename produces a TypeSet element-swap diff (one element removed,
-// one added) which Terraform would treat as an in-place update of the
-// set rather than a destroy-and-create — surprising to users whose
-// downstream resources reference the per-gateway PSC endpoint, IP, and
-// DNS record (all of which change on rename per the SGPE backend's
-// destroy-then-create map-key semantics).
-func sgpeGatewayConfigChecksFunc(diff tpgresource.TerraformResourceDiff) error {
-	plannedRaw := diff.Get("gateway_config")
-	planned := extractGatewayConfigBlocks(plannedRaw)
-
-	// Check 2: duplicate-name detection.
-	seen := make(map[string]bool, len(planned))
-	for _, name := range gatewayConfigNames(planned) {
-		if name == "" {
-			// Empty name is a different error class — let the schema's
-			// Required: true on the key field surface it during the
-			// generator's standard validation. Don't double-flag here.
-			continue
-		}
-		if seen[name] {
-			return fmt.Errorf("gateway_config.name %q is duplicated; each block must have a unique name.", name)
-		}
-		seen[name] = true
-	}
-
-	// Rename detection. Only fires when:
-	//   (a) the prior and planned sets have the same cardinality, AND
-	//   (b) at least one name changed.
-	// We DO NOT ForceNew on pure additions or removals — those are
-	// legitimate in-place Updates of the proto map (PATCH adds/removes
-	// keys without affecting other keys). Triggering ForceNew on
-	// add/remove would destroy stable gateways for users adding a
-	// second one — bad UX with no behavioral justification (the
-	// add/remove case doesn't have the per-gateway PSC infrastructure
-	// turnover that a rename does).
-	priorRaw, _ := diff.GetChange("gateway_config")
-	prior := extractGatewayConfigBlocks(priorRaw)
-	priorNames := gatewayConfigNames(prior)
-	plannedNames := gatewayConfigNames(planned)
-	if len(priorNames) == len(plannedNames) && len(priorNames) > 0 && !sameNameSet(priorNames, plannedNames) {
-		if err := diff.ForceNew("gateway_config"); err != nil {
-			return fmt.Errorf("failed to mark gateway_config ForceNew on rename: %s", err)
-		}
-	}
-
-	return nil
-}
-
-// sameNameSet returns true if a and b contain the same name values
-// (set semantics: order and duplicates ignored).
-func sameNameSet(a, b []string) bool {
-	if len(a) != len(b) {
-		// Different lengths => sets differ. (Pure adds/removes also
-		// fall into this branch, which is intentional — see the
-		// comment in sgpeGatewayConfigChecksFunc.)
-		return false
-	}
-	aSet := make(map[string]struct{}, len(a))
-	for _, name := range a {
-		aSet[name] = struct{}{}
-	}
-	for _, name := range b {
-		if _, ok := aSet[name]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
 // sgpeCustomizeDiff is the public CustomizeDiff entry point referenced from
 // the SemanticGovernancePolicyEngine.yaml `custom_diff:` list. It delegates
-// to sgpeFailedStateWarningCheck (Check 1) and sgpeGatewayConfigChecksFunc
-// (Check 2 + rename detection).
+// to sgpeFailedStateWarningCheck (Check 1).
 func sgpeCustomizeDiff(_ context.Context, diff *schema.ResourceDiff, meta interface{}) error {
 	if err := sgpeFailedStateWarningCheck(diff); err != nil {
-		return err
-	}
-	if err := sgpeGatewayConfigChecksFunc(diff); err != nil {
 		return err
 	}
 	return nil

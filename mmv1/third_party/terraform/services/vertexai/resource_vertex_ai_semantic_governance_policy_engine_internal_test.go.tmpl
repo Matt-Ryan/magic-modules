@@ -3,7 +3,6 @@ package vertexai
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
@@ -13,29 +12,16 @@ import (
 // mmv1/templates/terraform/constants/semantic_governance_policy_engine.go.tmpl
 // (generated into resource_vertex_ai_semantic_governance_policy_engine.go).
 //
-// Coverage map:
-//   TC-006  TestUnitSGPE_GatewayConfigChecks_renameForcesNew
-//           (the schema-level "ForceNew on synthetic name field" check
-//           originally specified in TEST_PLAN.md TC-006 was reframed
-//           when SLICE-4 implementation discovered that magic-modules'
-//           native Map type doesn't expose a key_immutable flag — the
-//           ForceNew-on-rename behavior is enforced at plan time by
-//           sgpeGatewayConfigChecksFunc instead. See ADR-0002 §Decision 2
-//           and the SLICE-5 design-doc correction list for context.)
-//   TC-008  TestUnitSGPE_PostReadDispatch_INACTIVE_clears_id
-//   TC-009  TestUnitSGPE_PostReadDispatch_unknownStates_return_error
-//   TC-010  TestUnitSGPE_PostReadDispatch_inStateBranches_no_op
-//   TC-011  TestUnitSGPE_FailedStateWarningCheck_FAILED_with_diff_succeeds
-//   TC-012  TestUnitSGPE_FailedStateWarningCheck_negativeCases_no_op
-//   TC-013  TestUnitSGPE_GatewayConfigChecks_duplicateName_returns_error
-//   (extra) TestUnitSGPE_GatewayConfigChecks_legitimateUpdates_doNotForceNew
-//           — confirms in-place per-element updates, pure adds, and
-//           pure removes do NOT trigger ForceNew. Reserves the
-//           rename-detector for true renames only.
+// Coverage:
+//   TestUnitSGPE_PostReadDispatch_INACTIVE_clears_id
+//   TestUnitSGPE_PostReadDispatch_unknownStates_return_error
+//   TestUnitSGPE_PostReadDispatch_inStateBranches_no_op
+//   TestUnitSGPE_FailedStateWarningCheck_FAILED_with_diff_succeeds
+//   TestUnitSGPE_FailedStateWarningCheck_negativeCases_no_op
 //
-// The CustomizeDiff tests (TC-011, TC-012) call sgpeFailedStateWarningCheck
-// directly through tpgresource.ResourceDiffMock, the established
-// magic-modules pattern (precedent:
+// The CustomizeDiff tests call sgpeFailedStateWarningCheck directly
+// through tpgresource.ResourceDiffMock, the established magic-modules
+// pattern (precedent:
 // resource_data_loss_prevention_stored_info_type_internal_test.go).
 //
 // The post_read tests (TC-008, TC-009, TC-010) cannot use a similar
@@ -213,126 +199,4 @@ func TestUnitSGPE_FailedStateWarningCheck_negativeCases_no_op(t *testing.T) {
 	}
 }
 
-// TC-013: Plan-time CustomizeDiff Check 2 errors on duplicate
-// gateway_config.name. The error message must match DESIGN_DOC §2.8
-// Check 2 verbatim (asserted via substring match on the duplicated
-// name token).
-func TestUnitSGPE_GatewayConfigChecks_duplicateName_returns_error(t *testing.T) {
-	t.Parallel()
-	// Two blocks share the name "primary"; the second occurrence
-	// triggers the error. We use the []map[string]interface{} form
-	// because the mock's Get returns it verbatim — extractGatewayConfigBlocks
-	// supports this case alongside the production *schema.Set case.
-	d := &tpgresource.ResourceDiffMock{
-		Before: map[string]interface{}{
-			"gateway_config": []map[string]interface{}{
-				{"name": "primary", "network": "n1"},
-			},
-		},
-		After: map[string]interface{}{
-			"gateway_config": []map[string]interface{}{
-				{"name": "primary", "network": "n1"},
-				{"name": "primary", "network": "n2"},
-			},
-		},
-	}
-	err := sgpeGatewayConfigChecksFunc(d)
-	if err == nil {
-		t.Fatal("expected duplicate-name error; got nil")
-	}
-	if !strings.Contains(err.Error(), `gateway_config.name "primary" is duplicated`) {
-		t.Errorf("error message did not match expected text;\n  got:      %q\n  expected substring: %q",
-			err.Error(), `gateway_config.name "primary" is duplicated`)
-	}
-}
-
-// TC-006: Renaming a gateway_config block triggers ForceNew on the
-// gateway_config attribute. The check is enforced at plan time by
-// sgpeGatewayConfigChecksFunc rather than by a schema flag (see the
-// coverage-map note above).
-func TestUnitSGPE_GatewayConfigChecks_renameForcesNew(t *testing.T) {
-	t.Parallel()
-	d := &tpgresource.ResourceDiffMock{
-		Before: map[string]interface{}{
-			"gateway_config": []map[string]interface{}{
-				{"name": "primary", "network": "n1"},
-			},
-		},
-		After: map[string]interface{}{
-			"gateway_config": []map[string]interface{}{
-				{"name": "main", "network": "n1"},
-			},
-		},
-	}
-	if err := sgpeGatewayConfigChecksFunc(d); err != nil {
-		t.Fatalf("expected nil error; got %v", err)
-	}
-	if !d.IsForceNew {
-		t.Error("expected ForceNew to be set on gateway_config after rename; was not")
-	}
-}
-
-// Negative cases for ForceNew: legitimate Update scenarios (in-place
-// per-element field update, pure add of a gateway, pure remove of a
-// gateway) MUST NOT trigger ForceNew. ForceNew is reserved for true
-// renames (same cardinality, different names).
-func TestUnitSGPE_GatewayConfigChecks_legitimateUpdates_doNotForceNew(t *testing.T) {
-	t.Parallel()
-	cases := map[string]*tpgresource.ResourceDiffMock{
-		"in-place per-element update (same names, different fields)": {
-			Before: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1"},
-					{"name": "secondary", "network": "n2"},
-				},
-			},
-			After: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1-updated"},
-					{"name": "secondary", "network": "n2"},
-				},
-			},
-		},
-		"pure add (one gateway becomes two)": {
-			Before: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1"},
-				},
-			},
-			After: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1"},
-					{"name": "secondary", "network": "n2"},
-				},
-			},
-		},
-		"pure remove (two gateways become one)": {
-			Before: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1"},
-					{"name": "secondary", "network": "n2"},
-				},
-			},
-			After: map[string]interface{}{
-				"gateway_config": []map[string]interface{}{
-					{"name": "primary", "network": "n1"},
-				},
-			},
-		},
-		"empty to empty (no gateways at all)": {
-			Before: map[string]interface{}{},
-			After:  map[string]interface{}{},
-		},
-	}
-	for name, d := range cases {
-		t.Run(name, func(t *testing.T) {
-			if err := sgpeGatewayConfigChecksFunc(d); err != nil {
-				t.Fatalf("expected nil error; got %v", err)
-			}
-			if d.IsForceNew {
-				t.Errorf("ForceNew should NOT fire for case %q (legitimate Update path)", name)
-			}
-		})
-	}
-}
 {{- end }}

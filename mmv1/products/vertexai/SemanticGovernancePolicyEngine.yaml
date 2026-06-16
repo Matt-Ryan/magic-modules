@@ -72,12 +72,6 @@ examples:
     # exclude_test: true until SGPE backend visibility is wide enough for
     # HashiCorp CI to run acceptance tests against a real project.
     exclude_test: true
-  - name: 'vertex_ai_semantic_governance_policy_engine_full'
-    primary_resource_id: 'sgpe'
-    exclude_test: true
-  - name: 'vertex_ai_semantic_governance_policy_engine_multi_gateway'
-    primary_resource_id: 'sgpe'
-    exclude_test: true
 parameters:
   - name: 'region'
     type: String
@@ -87,58 +81,6 @@ parameters:
     immutable: true
     default_from_api: true
 properties:
-  - name: 'targetProject'
-    type: String
-    description: |
-      Optional. The project that the SGPE governs. If unset, the SGPE
-      governs the project it is created in.
-  - name: 'gatewayConfig'
-    api_name: 'gatewayConfigs'
-    type: Map
-    description: |
-      Configurations for gateways. The map is keyed by a user-defined
-      `name` per block. Renaming a block forces re-creation of the
-      gateway (the synthetic `name` field is ForceNew).
-    key_name: 'name'
-    value_type:
-      type: NestedObject
-      properties:
-        - name: 'network'
-          type: String
-          description: |
-            The fully-qualified network URI for this gateway, e.g.
-            `projects/{project}/global/networks/{network}`.
-        - name: 'subnetwork'
-          type: String
-          description: |
-            The fully-qualified subnetwork URI for this gateway, e.g.
-            `projects/{project}/regions/{region}/subnetworks/{subnetwork}`.
-        - name: 'dnsZoneName'
-          type: String
-          description: |
-            The DNS zone name for this gateway's PSC endpoint.
-        - name: 'state'
-          type: String
-          description: |
-            The current state of this gateway. One of:
-            STATE_UNSPECIFIED, PROVISIONING, ACTIVE, FAILED,
-            DEPROVISIONING, INACTIVE.
-          output: true
-        - name: 'ipAddress'
-          type: String
-          description: |
-            The IP address allocated for this gateway's PSC endpoint.
-          output: true
-        - name: 'pscEndpoint'
-          type: String
-          description: |
-            The PSC endpoint URI for this gateway.
-          output: true
-        - name: 'dnsRecord'
-          type: String
-          description: |
-            The DNS record for this gateway's PSC endpoint.
-          output: true
   - name: 'name'
     type: String
     description: |
