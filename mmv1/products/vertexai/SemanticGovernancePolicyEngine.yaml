@@ -50,9 +50,9 @@ import_format:
 # update_mask is left at the magic-modules default (true) so the generator
 # emits a properly-scoped update_mask from the schema diff.
 timeouts:
-  insert_minutes: 20
-  update_minutes: 20
-  delete_minutes: 20
+  insert_minutes: 60
+  update_minutes: 60
+  delete_minutes: 60
 async:
   actions: ['create', 'update']
   type: 'OpAsync'
