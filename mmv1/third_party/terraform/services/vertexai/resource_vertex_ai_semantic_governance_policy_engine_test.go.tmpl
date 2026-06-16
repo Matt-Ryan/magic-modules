@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashicorp/terraform-provider-google/google/acctest"
 	"github.com/hashicorp/terraform-provider-google/google/envvar"
+	"github.com/hashicorp/terraform-provider-google/google/registry"
 	"github.com/hashicorp/terraform-provider-google/google/tpgresource"
 	transport_tpg "github.com/hashicorp/terraform-provider-google/google/transport"
 )
@@ -18,13 +19,23 @@ import (
 // TestAccVertexAISemanticGovernancePolicyEngine_lifecycle exercises the
 // full SGPE lifecycle in one Create/Destroy envelope:
 //
-//	Step 1: Apply basic fixture        (Create LRO ~20 min)
+//	Step 1: Apply basic fixture        (Create LRO ~5-45 min)
 //	Step 2: ImportStateVerify          (no LRO, just round-trip)
-//	Step 3: Apply updated fixture      (Update LRO ~20 min, target_project change)
+//	Step 3: Apply addGateway fixture   (Update LRO ~5-45 min, gateway_config block added)
 //	Step 4: ImportStateVerify          (no LRO)
-//	Step 5: Apply addGateway fixture   (Update LRO ~20 min, gateway_config block added)
-//	Step 6: ImportStateVerify          (no LRO)
-//	CheckDestroy: invokes custom_delete (Deprovision LRO ~20 min)
+//	CheckDestroy: invokes custom_delete (Deprovision LRO ~5-45 min)
+//
+// `target_project` is set in the basic fixture (Step 1) rather than
+// introduced via an Update step. The backend honors target_project at
+// Create time (it determines which project the consumer-side network,
+// PSC, and DNS resources are provisioned in for Shared VPC scenarios),
+// but discards the field on Update -- see HAND_TEST_FINDINGS.md F11
+// for the file:line evidence in
+// UpdateSemanticGovernancePolicyEngineApiHandler.java:287-305. Until
+// the backend either honors Update changes or returns INVALID_ARGUMENT,
+// we cannot test the Update path for this field, and the Terraform
+// schema should treat the field as effectively immutable. Whether to
+// model that with `immutable: true` (ForceNew) is OQ #N in TASK_PLAN.md.
 //
 // Pattern source: TestAccVertexAIFeatureGroup_updated in
 // resource_vertex_ai_feature_group_test.go.
@@ -40,8 +51,8 @@ func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
 	t.Parallel()
 
 	context := map[string]interface{}{
-		"project":         envvar.GetTestProjectFromEnv(),
-		"target_project":  envvar.GetTestProjectFromEnv(),
+		"project":        envvar.GetTestProjectFromEnv(),
+		"target_project": envvar.GetTestProjectFromEnv(),
 	}
 
 	acctest.VcrTest(t, resource.TestCase{
@@ -49,13 +60,19 @@ func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
 		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
 		CheckDestroy:             testAccCheckVertexAISemanticGovernancePolicyEngineDestroyProducer(t),
 		Steps: []resource.TestStep{
-			// Step 1: Create with the basic fixture (no target_project).
+			// Step 1: Create with target_project set. This is the only
+			// path that exercises target_project, because the backend
+			// silently drops the field on subsequent Update requests
+			// (see header comment + F11).
 			{
 				Config: testAccVertexAISemanticGovernancePolicyEngine_basic(context),
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
 						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
 						"state", "ACTIVE"),
+					resource.TestCheckResourceAttr(
+						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
+						"target_project", context["target_project"].(string)),
 					resource.TestCheckResourceAttrSet(
 						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
 						"name"),
@@ -65,43 +82,41 @@ func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
 					resource.TestCheckResourceAttrSet(
 						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
 						"psc_service_attachment"),
-					resource.TestCheckResourceAttrSet(
-						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
-						"ip_address"),
+					// NOTE: `ip_address` and `psc_forwarding_rule` are NOT
+					// asserted here because they do not populate at Create
+					// time on the producer-side resource. They are populated
+					// only after a consumer creates a PSC forwarding rule
+					// referencing this engine. The basic fixture has no
+					// consumer, so these fields remain null until then.
+					// See user-facing docs in the YAML `description` field.
 				),
 			},
 			// Step 2: ImportStateVerify after Create. Confirms the
-			// importer round-trips state cleanly.
+			// importer round-trips state cleanly, including
+			// target_project.
 			{
 				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
 				ImportState:       true,
 				ImportStateVerify: true,
 			},
-			// Step 3: Update — set target_project. This exercises the
-			// PATCH+update_mask path; the request URL should contain
-			// ?updateMask=targetProject (verifiable via TF_LOG=DEBUG
-			// capture, not asserted programmatically here).
-			{
-				Config: testAccVertexAISemanticGovernancePolicyEngine_updated(context),
-				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr(
-						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
-						"target_project", context["target_project"].(string)),
-					resource.TestCheckResourceAttr(
-						"google_vertex_ai_semantic_governance_policy_engine.sgpe",
-						"state", "ACTIVE"),
-				),
-			},
-			// Step 4: ImportStateVerify after Update.
-			{
-				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
-				ImportState:       true,
-				ImportStateVerify: true,
-			},
-			// Step 5: addGateway — add one gateway_config block. This
-			// exercises the native Map declaration's expand path: the
-			// HCL TypeSet element should round-trip into the proto
-			// gatewayConfigs map keyed by `name`.
+			// Step 3: addGateway -- add one gateway_config block. This
+			// exercises:
+			//   (a) The native Map declaration's expand path: the HCL
+			//       TypeSet element should round-trip into the proto
+			//       gatewayConfigs map keyed by `name`.
+			//   (b) The Update path itself, since gateway_configs is
+			//       the only field the backend currently honors on
+			//       Update (it has explicit update_mask handling at
+			//       UpdateSemanticGovernancePolicyEngineApiHandler.java
+			//       :349-351, unlike target_project).
+			//
+			// The fixture also creates a google_dns_managed_zone
+			// resource that the gateway_config references via
+			// dns_zone_name. The SGPE backend validator requires
+			// network+subnetwork+dns_zone_name to be all-set or
+			// all-unset (see fixture comment for evidence). The
+			// managed zone is created via terraform in the same
+			// apply so the test is self-contained.
 			{
 				Config: testAccVertexAISemanticGovernancePolicyEngine_addGateway(context),
 				Check: resource.ComposeTestCheckFunc(
@@ -119,11 +134,11 @@ func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
 						"gateway_config.0.ip_address"),
 				),
 			},
-			// Step 6: ImportStateVerify after addGateway. The presence of
+			// Step 4: ImportStateVerify after addGateway. The presence of
 			// this step is the critical SGPE-specific assertion: it
 			// confirms the native Map declaration's flatten path produces
 			// a stable round-trip through Import (no drift in the proto
-			// map → TypeSet conversion).
+			// map -> TypeSet conversion).
 			{
 				ResourceName:      "google_vertex_ai_semantic_governance_policy_engine.sgpe",
 				ImportState:       true,
@@ -136,18 +151,9 @@ func TestAccVertexAISemanticGovernancePolicyEngine_lifecycle(t *testing.T) {
 func testAccVertexAISemanticGovernancePolicyEngine_basic(context map[string]interface{}) string {
 	return acctest.Nprintf(`
 resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
-  region   = "us-central1"
-  provider = google-beta
-}
-`, context)
-}
-
-func testAccVertexAISemanticGovernancePolicyEngine_updated(context map[string]interface{}) string {
-	return acctest.Nprintf(`
-resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
-  region          = "us-central1"
-  target_project  = "%{target_project}"
-  provider        = google-beta
+  region         = "us-central1"
+  target_project = "%{target_project}"
+  provider       = google-beta
 }
 `, context)
 }
@@ -158,16 +164,55 @@ data "google_project" "project" {
   provider = google-beta
 }
 
+# The SGPE backend validator requires that gateway_config.{network,
+# subnetwork, dns_zone_name} are ALL set or ALL unset
+# (UpdateSemanticGovernancePolicyEngineApiHandler.java:108-112).
+# Once set, the deploy task writes an A record into the named
+# managed zone (DeploySemanticGovernanceConsumerNetworkTaskHandler
+# .java:391-407 calls CreateDnsRecordPayload with
+# managed_zone_name=dns_zone_name and record_name=<region>). The
+# zone must exist and be readable from the gateway's VPC at
+# provisioning time. To keep this test self-contained (i.e. runnable
+# in any project with a 'default' VPC + subnet, including HashiCorp
+# CI projects), we create the managed zone alongside the SGPE.
+#
+# The zone is private and attached to the same 'default' VPC the
+# SGPE references, so the A record SGPE writes is resolvable from
+# the PSC endpoint. 'example.com.' is an RFC 2606 reserved domain,
+# so there's no risk of conflict with a real DNS zone.
+#
+# SGPE depends_on the managed zone explicitly so:
+#   - Create order: zone first, SGPE second.
+#   - Destroy order: SGPE first (deprovision LRO cleans up the
+#     A record per CleanupConsumerNetworkTaskHandler.java:220-228),
+#     then zone (now empty and safe to delete).
+resource "google_dns_managed_zone" "sgpe_zone" {
+  provider    = google-beta
+  name        = "tf-sgpe-tc014-zone"
+  dns_name    = "sgpe-tc014.example.com."
+  description = "Private DNS zone for SGPE TC-014 acceptance test."
+  visibility  = "private"
+
+  private_visibility_config {
+    networks {
+      network_url = "projects/${data.google_project.project.project_id}/global/networks/default"
+    }
+  }
+}
+
 resource "google_vertex_ai_semantic_governance_policy_engine" "sgpe" {
-  region          = "us-central1"
-  target_project  = "%{target_project}"
-  provider        = google-beta
+  region         = "us-central1"
+  target_project = "%{target_project}"
+  provider       = google-beta
 
   gateway_config {
-    name       = "primary"
-    network    = "projects/${data.google_project.project.project_id}/global/networks/default"
-    subnetwork = "projects/${data.google_project.project.project_id}/regions/us-central1/subnetworks/default"
+    name          = "primary"
+    network       = "projects/${data.google_project.project.project_id}/global/networks/default"
+    subnetwork    = "projects/${data.google_project.project.project_id}/regions/us-central1/subnetworks/default"
+    dns_zone_name = google_dns_managed_zone.sgpe_zone.name
   }
+
+  depends_on = [google_dns_managed_zone.sgpe_zone]
 }
 `, context)
 }
@@ -189,7 +234,16 @@ func testAccCheckVertexAISemanticGovernancePolicyEngineDestroyProducer(t *testin
 
 			config := acctest.GoogleProviderConfig(t)
 
-			url, err := tpgresource.ReplaceVarsForTest(config, rs, "{{"{{"}}VertexAIBasePath{{"}}"}}projects/{{"{{"}}project{{"}}"}}/locations/{{"{{"}}region{{"}}"}}/semanticGovernancePolicyEngine")
+			// URL is constructed via fmt.Sprintf("%s%s", BaseUrl, ...)
+			// rather than via the {{"{{"}}VertexAIBasePath{{"}}"}} placeholder
+			// because ReplaceVarsForTest is single-pass: it would expand
+			// {{"{{"}}VertexAIBasePath{{"}}"}} to the autopush URL
+			// (`https://{{"{{"}}region{{"}}"}}-autopush-aiplatform.sandbox.googleapis.com/v1beta1/`),
+			// but the literal {{"{{"}}region{{"}}"}} inside that expansion
+			// would NOT be rescanned and substituted. The Sprintf form
+			// pre-resolves BaseUrl so all {{"{{"}}var{{"}}"}} markers in the
+			// final string get substituted in one pass.
+			url, err := tpgresource.ReplaceVarsForTest(config, rs, fmt.Sprintf("%s%s", transport_tpg.BaseUrl(registry.GetProduct("vertexai"), config), "projects/{{"{{"}}project{{"}}"}}/locations/{{"{{"}}region{{"}}"}}/semanticGovernancePolicyEngine"))
 			if err != nil {
 				return err
 			}
