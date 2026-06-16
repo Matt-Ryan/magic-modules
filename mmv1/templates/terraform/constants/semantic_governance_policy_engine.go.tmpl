@@ -6,30 +6,29 @@
 // Two groups of helpers live here:
 //
 //  1. sgpePostReadDispatch — the 6-way state translation invoked from
-//     the post_read template. See ADR-0002 §Decision 1.
+//     the post_read template.
 //
 //  2. sgpeFailedStateWarningCheck + sgpeCustomizeDiff — the plan-time
 //     CustomizeDiff helpers invoked via the YAML's custom_diff: list.
-//     See ADR-0002 §Decision 5 and its Implementation Notes.
 //
 // Both groups are split into "testable inner func" + "production wrapper"
-// per the Spanner template precedent
+// following the Spanner template precedent
 // (mmv1/templates/terraform/constants/spanner_database.go.tmpl) so that
 // unit tests can exercise the logic directly via tpgresource.ResourceDiffMock
-// and direct invocation. See ADR-0002 §Decision 5 Implementation Notes
-// for the testability-pattern rationale.
+// and direct invocation, rather than having to spin up a full
+// *schema.ResourceDiff.
 
 // ---------------------------------------------------------------------------
 // post_read state dispatch
 // ---------------------------------------------------------------------------
 
 // sgpePostReadDispatch implements the 6-way state translation for the
-// SemanticGovernancePolicyEngine Read flow per DESIGN_DOC.md §2.2 case 2,
-// §6.2, and HLD.md §4.5. It runs after the standard Read has fetched the
-// engine and stored the response in `res`, but before the schema fields
-// are populated from `res` (per resource.go.tmpl ordering).
+// SemanticGovernancePolicyEngine Read flow. It runs after the standard
+// Read has fetched the engine and stored the response in `res`, but
+// before the schema fields are populated from `res` (per resource.go.tmpl
+// ordering).
 //
-// State -> behavior table (per ADR-0002 §Decision 1):
+// State -> behavior table:
 //
 //	ACTIVE, FAILED                  -> populate schema, return nil
 //	PROVISIONING, DEPROVISIONING    -> populate schema, emit [WARN], return nil
@@ -59,9 +58,11 @@ func sgpePostReadDispatch(d *schema.ResourceData, res map[string]interface{}) er
 		d.SetId("")
 		return nil
 	default:
-		// STATE_UNSPECIFIED or any unrecognized enum value. Loud-failure stance
-		// per ADR-0002 §Decision 1 (rejected alternative: silent coercion to
-		// INACTIVE was framed as "a destructive default disguised as defensive").
+		// STATE_UNSPECIFIED or any unrecognized enum value. Loud-failure
+		// stance: silent coercion to INACTIVE was rejected because it
+		// would silently trigger destructive Terraform actions (re-create)
+		// when the backend introduces a new state the provider does not
+		// yet recognize.
 		return fmt.Errorf("SemanticGovernancePolicyEngine returned unrecognized state %q; this provider version does not support it. Check for a newer terraform-provider-google release.", state)
 	}
 }
@@ -109,9 +110,9 @@ func sgpeHasNonEmptyDiff(diff tpgresource.TerraformResourceDiff) bool {
 	return false
 }
 
-// sgpeFailedStateWarningCheck implements Check 1 from ADR-0002 §Decision 5
-// (and DESIGN_DOC.md §2.8). It is the testable internal entry point; the
-// public YAML-facing wrapper is sgpeCustomizeDiff below.
+// sgpeFailedStateWarningCheck warns the user when they attempt to apply
+// a change against an engine in FAILED state. It is the testable internal
+// entry point; the public YAML-facing wrapper is sgpeCustomizeDiff below.
 //
 // Behavior:
 //   - Reads the prior-state `state` value via diff.GetChange("state") (the
@@ -126,12 +127,14 @@ func sgpeHasNonEmptyDiff(diff tpgresource.TerraformResourceDiff) bool {
 //     would be diluted by sharing this warning).
 //
 // Warning visibility: log.Printf("[WARN] ...") is the established
-// magic-modules convention for non-blocking CustomizeDiff warnings (see
+// non-blocking CustomizeDiff warning pattern (see
 // mmv1/templates/terraform/constants/deployment_manager_deployment.go.tmpl).
 // Plugin SDK v2's CustomizeDiff signature returns error only — there is no
 // Diagnostics channel — so the warning is visible at TF_LOG=WARN or higher,
-// not in plain `terraform plan` output. See ADR-0002 §Decision 5
-// Implementation Notes for the full rationale.
+// not in plain `terraform plan` output. This is a deliberate trade-off:
+// surfacing the warning at higher visibility would require either blocking
+// the plan (too aggressive — the change may legitimately want to proceed)
+// or upgrading to plugin-framework, which is a much larger migration.
 func sgpeFailedStateWarningCheck(diff tpgresource.TerraformResourceDiff) error {
 	priorStateRaw, _ := diff.GetChange("state")
 	priorState, ok := priorStateRaw.(string)

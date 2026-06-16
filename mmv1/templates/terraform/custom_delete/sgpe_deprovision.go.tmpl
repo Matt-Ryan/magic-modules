@@ -3,8 +3,8 @@
 // SGPE is a singleton resource per AIP-156: it has no standard Delete
 // RPC. Tear-down is performed via a custom :deprovision RPC that POSTs
 // to a sibling URL with an empty body. After deprovision completes, a
-// subsequent Get returns the singleton with state INACTIVE (rather than
-// HTTP 404 — see ADR-0001).
+// subsequent Get returns the singleton with state INACTIVE rather than
+// HTTP 404; this is the AIP-156 singleton contract.
 //
 // Errors from :deprovision are returned verbatim — we deliberately do
 // NOT wrap them with transport_tpg.HandleNotFoundError. The wrapping
@@ -13,7 +13,7 @@
 // :deprovision would indicate a URL bug, a permissions issue masquerading
 // as 404, or a backend regression breaking the AIP-156 contract — none
 // of which should be silently absorbed as "delete success." Loud failure
-// beats silent coercion. See ADR-0002 §Decision 4.
+// is preferred over silent coercion here.
 log.Printf("[DEBUG] Beginning custom_delete for SemanticGovernancePolicyEngine")
 
 project, err := tpgresource.GetProject(d, config)
@@ -41,8 +41,8 @@ deprovisionRes, err := transport_tpg.SendRequest(transport_tpg.SendRequestOption
 	Headers:   deprovisionHeaders,
 })
 if err != nil {
-	// Verbatim error return per ADR-0002 §Decision 4. NOT wrapped with
-	// transport_tpg.HandleNotFoundError.
+	// Verbatim error return; NOT wrapped with
+	// transport_tpg.HandleNotFoundError — see file header for rationale.
 	return fmt.Errorf("Error deprovisioning SemanticGovernancePolicyEngine: %s", err)
 }
 
